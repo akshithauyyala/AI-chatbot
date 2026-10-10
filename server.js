@@ -1,21 +1,87 @@
-'use strict';
-const http=require('node:http');const fs=require('node:fs');const path=require('node:path');
-const ROOT=__dirname,PORT=Number(process.env.PORT||3000),API_URL=(process.env.AI_API_URL||'https://api.openai.com/v1/chat/completions').replace(/\/$/,''),MODEL=process.env.AI_MODEL||'gpt-4o-mini',KEY=process.env.AI_API_KEY||process.env.OPENAI_API_KEY;
-const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.md':'text/markdown; charset=utf-8'};
-const server=http.createServer(async(req,res)=>{
-  const url=new URL(req.url,'http://localhost');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Content-Security-Policy',"default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; img-src 'self' data:");
-  if(url.pathname==='/api/config'&&req.method==='GET'){return json(res,200,{configured:Boolean(KEY&&process.env.AI_MODEL),model:MODEL});}
-  if(url.pathname==='/api/chat'&&req.method==='POST'){
-    if(!KEY)return json(res,503,{error:'AI service is not configured. Add AI_API_KEY (or OPENAI_API_KEY) and AI_MODEL to the environment, then restart the server.'});
-    let body;try{body=await readJson(req,256*1024);}catch(e){return json(res,e.status||400,{error:e.message});}
-    if(!Array.isArray(body.messages)||!body.messages.length||body.messages.length>100||body.messages.some(m=>!m||!['user','assistant'].includes(m.role)||typeof m.content!=='string'||m.content.length>12000))return json(res,400,{error:'Invalid conversation. Each message must contain a supported role and text under 12,000 characters.'});
-    try{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),60000);let upstream;try{upstream=await fetch(API_URL,{method:'POST',signal:controller.signal,headers:{'Authorization':`Bearer ${KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:MODEL,messages:[{role:'system',content:process.env.AI_SYSTEM_PROMPT||'You are a helpful, clear, and thoughtful AI assistant. Do not invent personal information about the portfolio owner.'},...body.messages],temperature:0.7})});}finally{clearTimeout(timer);}
-      const payload=await upstream.json().catch(()=>null);if(!upstream.ok){const status=upstream.status;let message=status===401?'The AI service rejected the API key. Check your server configuration.':status===429?'The AI service is rate limited. Wait a moment and retry.':status>=500?'The AI service is temporarily unavailable. Please retry shortly.':payload?.error?.message||`The AI service returned an error (${status}).`;return json(res,status>=500?502:status,{error:message});}
-      const reply=payload?.choices?.[0]?.message?.content;if(typeof reply!=='string'||!reply.trim())return json(res,502,{error:'The AI service returned an empty or unsupported response.'});return json(res,200,{reply});
-    }catch(e){return json(res,e.name==='AbortError'?504:502,{error:e.name==='AbortError'?'The request timed out. Please retry.':'Could not connect to the AI service. Check your network and API endpoint.'});}
-  }
-  if(req.method!=='GET'&&req.method!=='HEAD')return json(res,405,{error:'Method not allowed.'});let name=decodeURIComponent(url.pathname==='/'?'/index.html':url.pathname);if(name==='/README.md')name='/README.md';const target=path.resolve(ROOT,`.${name}`);if(!target.startsWith(ROOT+path.sep))return json(res,403,{error:'Forbidden.'});fs.readFile(target,(err,data)=>{if(err)return json(res,404,{error:'Not found.'});res.writeHead(200,{'Content-Type':types[path.extname(target)]||'application/octet-stream','Cache-Control':'no-store'});res.end(req.method==='HEAD'?undefined:data);});
+
+import "dotenv/config";
+import express from "express";
+import Groq from "groq-sdk";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const port = Number(process.env.PORT) || 3000;
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
-function json(res,status,value){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(value));}
-function readJson(req,limit){return new Promise((resolve,reject)=>{let data='',size=0;req.on('data',chunk=>{size+=chunk.length;if(size>limit){const e=new Error('Request is too large.');e.status=413;reject(e);req.destroy();}else data+=chunk;});req.on('end',()=>{try{resolve(JSON.parse(data));}catch{const e=new Error('Request body must be valid JSON.');e.status=400;reject(e);}});req.on('error',reject);});}
-server.listen(PORT,'127.0.0.1',()=>console.log(`Akshitha AI listening on http://127.0.0.1:${PORT}`));
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+app.post("/api/chat", async (req, res) => {
+  console.log("Chat request received");
+
+  try {
+    const messages = Array.isArray(req.body?.messages)
+      ? req.body.messages
+      : [];
+
+    const safeMessages = messages
+      .filter(
+        (m) =>
+          m &&
+          ["user", "assistant"].includes(m.role) &&
+          typeof m.content === "string" &&
+          m.content.trim()
+      )
+      .slice(-20)
+      .map((m) => ({
+        role: m.role,
+        content: m.content.trim().slice(0, 12000),
+      }));
+
+    if (!safeMessages.length) {
+      return res.status(400).json({
+        error: "Please enter a message.",
+      });
+    }
+
+    console.log("Sending message to Groq...");
+
+    const completion = await groq.chat.completions.create({
+      model: "openai/gpt-oss-120b",
+      messages: [
+        {
+          role: "system",
+          content: "You are a helpful AI assistant. Answer clearly and naturally.",
+        },
+        ...safeMessages,
+      ],
+      max_tokens: 1024,
+    });
+
+    const reply = completion.choices?.[0]?.message?.content;
+
+    console.log("Groq reply:", reply);
+
+    return res.json({
+      reply: reply || "The AI returned an empty response.",
+    });
+  } catch (error) {
+    console.error("CHAT ERROR:", error.message);
+    console.error("STATUS:", error.status);
+    console.error("CODE:", error.code);
+
+    return res.status(500).json({
+      error: error.message || "Unknown server error",
+    });
+  }
+});
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.listen(port, () => {
+  console.log(`AI chatbot running at http://localhost:${port}`);
+});
